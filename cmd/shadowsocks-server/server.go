@@ -24,7 +24,7 @@ import (
 
 const (
 	idType  = 0 // address type index
-	idIP0   = 1 // ip addres start index
+	idIP0   = 1 // ip address start index
 	idDmLen = 1 // domain address length index
 	idDm0   = 2 // domain address start index
 
@@ -32,17 +32,18 @@ const (
 	typeDm   = 3 // type is domain address
 	typeIPv6 = 4 // type is ipv6 address
 
-	lenIPv4     = net.IPv4len + 2 // ipv4 + 2port
-	lenIPv6     = net.IPv6len + 2 // ipv6 + 2port
-	lenDmBase   = 2               // 1addrLen + 2port, plus addrLen
-	lenHmacSha1 = 10
+	lenIPv4   = net.IPv4len + 2 // ipv4 + 2port
+	lenIPv6   = net.IPv6len + 2 // ipv6 + 2port
+	lenDmBase = 2               // 1addrLen + 2port, plus addrLen
+	// lenHmacSha1 = 10
 )
 
 var debug ss.DebugLog
+var sanitizeIps bool
 var udp bool
 var managerAddr string
 
-func getRequest(conn *ss.Conn, auth bool) (host string, ota bool, err error) {
+func getRequest(conn *ss.Conn) (host string, err error) {
 	ss.SetReadTimeout(conn)
 
 	// buf size should at least have the same size with the largest possible
@@ -89,29 +90,23 @@ func getRequest(conn *ss.Conn, auth bool) (host string, ota bool, err error) {
 	// parse port
 	port := binary.BigEndian.Uint16(buf[reqEnd-2 : reqEnd])
 	host = net.JoinHostPort(host, strconv.Itoa(int(port)))
-	// if specified one time auth enabled, we should verify this
-	if auth || addrType&ss.OneTimeAuthMask > 0 {
-		ota = true
-		if _, err = io.ReadFull(conn, buf[reqEnd:reqEnd+lenHmacSha1]); err != nil {
-			return
-		}
-		iv := conn.GetIv()
-		key := conn.GetKey()
-		actualHmacSha1Buf := ss.HmacSha1(append(iv, key...), buf[:reqEnd])
-		if !bytes.Equal(buf[reqEnd:reqEnd+lenHmacSha1], actualHmacSha1Buf) {
-			err = fmt.Errorf("verify one time auth failed, iv=%v key=%v data=%v", iv, key, buf[:reqEnd])
-			return
-		}
-	}
 	return
 }
 
 const logCntDelta = 100
 
 var connCnt int
-var nextLogConnCnt int = logCntDelta
+var nextLogConnCnt = logCntDelta
 
-func handleConnection(conn *ss.Conn, auth bool, port string) {
+func sanitizeAddr(addr net.Addr) string {
+	if sanitizeIps {
+		return "x.x.x.x:zzzz"
+	} else {
+		return addr.String()
+	}
+}
+
+func handleConnection(conn *ss.Conn, port string) {
 	var host string
 
 	connCnt++ // this maybe not accurate, but should be enough
@@ -126,12 +121,12 @@ func handleConnection(conn *ss.Conn, auth bool, port string) {
 	// function arguments are always evaluated, so surround debug statement
 	// with if statement
 	if debug {
-		debug.Printf("new client %s->%s\n", conn.RemoteAddr().String(), conn.LocalAddr())
+		debug.Printf("new client %s->%s\n", sanitizeAddr(conn.RemoteAddr()), conn.LocalAddr())
 	}
 	closed := false
 	defer func() {
 		if debug {
-			debug.Printf("closed pipe %s<->%s\n", conn.RemoteAddr(), host)
+			debug.Printf("closed pipe %s<->%s\n", sanitizeAddr(conn.RemoteAddr()), host)
 		}
 		connCnt--
 		if !closed {
@@ -139,9 +134,9 @@ func handleConnection(conn *ss.Conn, auth bool, port string) {
 		}
 	}()
 
-	host, ota, err := getRequest(conn, auth)
+	host, err := getRequest(conn)
 	if err != nil {
-		log.Println("error getting request", conn.RemoteAddr(), conn.LocalAddr(), err)
+		log.Println("error getting request", sanitizeAddr(conn.RemoteAddr()), conn.LocalAddr(), err)
 		closed = true
 		return
 	}
@@ -169,23 +164,16 @@ func handleConnection(conn *ss.Conn, auth bool, port string) {
 		}
 	}()
 	if debug {
-		debug.Printf("piping %s<->%s ota=%v connOta=%v", conn.RemoteAddr(), host, ota, conn.IsOta())
+		debug.Printf("piping %s<->%s", sanitizeAddr(conn.RemoteAddr()), host)
 	}
-	if ota {
-		go func() {
-			ss.PipeThenCloseOta(conn, remote, func(flow int) {
-				passwdManager.addFlow(port, flow)
-			})
-		}()
-	} else {
-		go func() {
-			ss.PipeThenClose(conn, remote, func(flow int) {
-				passwdManager.addFlow(port, flow)
-			})
-		}()
-	}
-	ss.PipeThenClose(remote, conn, func(flow int) {
-		passwdManager.addFlow(port, flow)
+	go func() {
+		ss.PipeThenClose(conn, remote, func(Traffic int) {
+			passwdManager.addTraffic(port, Traffic)
+		})
+	}()
+
+	ss.PipeThenClose(remote, conn, func(Traffic int) {
+		passwdManager.addTraffic(port, Traffic)
 	})
 
 	closed = true
@@ -206,13 +194,13 @@ type PasswdManager struct {
 	sync.Mutex
 	portListener map[string]*PortListener
 	udpListener  map[string]*UDPListener
-	flowStats    map[string]int64
+	trafficStats map[string]int64
 }
 
 func (pm *PasswdManager) add(port, password string, listener net.Listener) {
 	pm.Lock()
 	pm.portListener[port] = &PortListener{password, listener}
-	pm.flowStats[port] = 0
+	pm.trafficStats[port] = 0
 	pm.Unlock()
 }
 
@@ -251,24 +239,24 @@ func (pm *PasswdManager) del(port string) {
 	pl.listener.Close()
 	pm.Lock()
 	delete(pm.portListener, port)
-	delete(pm.flowStats, port)
+	delete(pm.trafficStats, port)
 	if udp {
 		delete(pm.udpListener, port)
 	}
 	pm.Unlock()
 }
 
-func (pm *PasswdManager) addFlow(port string, n int) {
+func (pm *PasswdManager) addTraffic(port string, n int) {
 	pm.Lock()
-	pm.flowStats[port] = pm.flowStats[port] + int64(n)
+	pm.trafficStats[port] = pm.trafficStats[port] + int64(n)
 	pm.Unlock()
 	return
 }
 
-func (pm *PasswdManager) getFlowStats() map[string]int64 {
+func (pm *PasswdManager) getTrafficStats() map[string]int64 {
 	pm.Lock()
 	copy := make(map[string]int64)
-	for k, v := range pm.flowStats {
+	for k, v := range pm.trafficStats {
 		copy[k] = v
 	}
 	pm.Unlock()
@@ -279,7 +267,7 @@ func (pm *PasswdManager) getFlowStats() map[string]int64 {
 // port. A different approach would be directly change the password used by
 // that port, but that requires **sharing** password between the port listener
 // and password manager.
-func (pm *PasswdManager) updatePortPasswd(port, password string, auth bool) {
+func (pm *PasswdManager) updatePortPasswd(port, password string) {
 	pl, ok := pm.get(port)
 	if !ok {
 		log.Printf("new port %s added\n", port)
@@ -292,7 +280,7 @@ func (pm *PasswdManager) updatePortPasswd(port, password string, auth bool) {
 	}
 	// run will add the new port listener to passwdManager.
 	// So there maybe concurrent access to passwdManager and we need lock to protect it.
-	go run(port, password, auth)
+	go run(port, password)
 	if udp {
 		pl, ok := pm.getUDP(port)
 		if !ok {
@@ -304,14 +292,14 @@ func (pm *PasswdManager) updatePortPasswd(port, password string, auth bool) {
 			log.Printf("closing udp port %s to update password\n", port)
 			pl.listener.Close()
 		}
-		go runUDP(port, password, auth)
+		go runUDP(port, password)
 	}
 }
 
 var passwdManager = PasswdManager{
 	portListener: map[string]*PortListener{},
 	udpListener:  map[string]*UDPListener{},
-	flowStats:    map[string]int64{},
+	trafficStats: map[string]int64{},
 }
 
 func updatePasswd() {
@@ -328,13 +316,13 @@ func updatePasswd() {
 		return
 	}
 	for port, passwd := range config.PortPassword {
-		passwdManager.updatePortPasswd(port, passwd, config.Auth)
+		passwdManager.updatePortPasswd(port, passwd)
 		if oldconfig.PortPassword != nil {
 			delete(oldconfig.PortPassword, port)
 		}
 	}
 	// port password still left in the old config should be closed
-	for port, _ := range oldconfig.PortPassword {
+	for port := range oldconfig.PortPassword {
 		log.Printf("closing port %s as it's deleted\n", port)
 		passwdManager.del(port)
 	}
@@ -355,7 +343,7 @@ func waitSignal() {
 	}
 }
 
-func run(port, password string, auth bool) {
+func run(port, password string) {
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		log.Printf("error listening port %v: %v\n", port, err)
@@ -381,11 +369,11 @@ func run(port, password string, auth bool) {
 				continue
 			}
 		}
-		go handleConnection(ss.NewConn(conn, cipher.Copy()), auth, port)
+		go handleConnection(ss.NewConn(conn, cipher.Copy()), port)
 	}
 }
 
-func runUDP(port, password string, auth bool) {
+func runUDP(port, password string) {
 	var cipher *ss.Cipher
 	port_i, _ := strconv.Atoi(port)
 	log.Printf("listening udp port %v\n", port)
@@ -404,10 +392,10 @@ func runUDP(port, password string, auth bool) {
 		log.Printf("Error generating cipher for udp port: %s %v\n", port, err)
 		conn.Close()
 	}
-	SecurePacketConn := ss.NewSecurePacketConn(conn, cipher.Copy(), auth)
+	SecurePacketConn := ss.NewSecurePacketConn(conn, cipher.Copy())
 	for {
-		if err := ss.ReadAndHandleUDPReq(SecurePacketConn, func(flow int) {
-			passwdManager.addFlow(port, flow)
+		if err := ss.ReadAndHandleUDPReq(SecurePacketConn, func(traffic int) {
+			passwdManager.addTraffic(port, traffic)
 		}); err != nil {
 			debug.Printf("udp read error: %v\n", err)
 			return
@@ -453,6 +441,7 @@ func main() {
 	flag.StringVar(&cmdConfig.Method, "m", "", "encryption method, default: aes-256-cfb")
 	flag.IntVar(&core, "core", 0, "maximum number of CPU cores to use, default is determinied by Go runtime")
 	flag.BoolVar((*bool)(&debug), "d", false, "print debug message")
+	flag.BoolVar((*bool)(&sanitizeIps), "A", false, "anonymize client ip addresses in all output")
 	flag.BoolVar(&udp, "u", false, "UDP Relay")
 	flag.StringVar(&managerAddr, "manager-address", "", "shadowsocks manager listening address")
 	flag.Parse()
@@ -463,11 +452,6 @@ func main() {
 	}
 
 	ss.SetDebug(debug)
-
-	if strings.HasSuffix(cmdConfig.Method, "-auth") {
-		cmdConfig.Method = cmdConfig.Method[:len(cmdConfig.Method)-5]
-		cmdConfig.Auth = true
-	}
 
 	var err error
 	config, err = ss.ParseConfig(configFile)
@@ -495,9 +479,9 @@ func main() {
 		runtime.GOMAXPROCS(core)
 	}
 	for port, password := range config.PortPassword {
-		go run(port, password, config.Auth)
+		go run(port, password)
 		if udp {
-			go runUDP(port, password, config.Auth)
+			go runUDP(port, password)
 		}
 	}
 
@@ -529,11 +513,10 @@ func managerDaemon(conn *net.UDPConn) {
 	go func() {
 		timer := time.Tick(10 * time.Second)
 		for {
-			<-timer
-			switch {
+			select {
 			case <-ctx:
 				return
-			default:
+			case <-timer:
 				for _, addr := range reportconnSet {
 					res := reportStat()
 					if len(res) == 0 {
@@ -591,7 +574,7 @@ func handleAddPort(payload []byte) []byte {
 	if port == "" {
 		return []byte("err")
 	}
-	passwdManager.updatePortPasswd(port, params.Password, config.Auth)
+	passwdManager.updatePortPasswd(port, params.Password)
 	return []byte("ok")
 }
 
@@ -617,10 +600,10 @@ func handlePing() []byte {
 	return []byte("pong")
 }
 
-// reportStat get the stat:flowStat and return avery 10 sec as for the protocol
+// reportStat get the stat:trafficStat and return avery 10 sec as for the protocol
 // https://github.com/shadowsocks/shadowsocks/wiki/Manage-Multiple-Users
 func reportStat() []byte {
-	stats := passwdManager.getFlowStats()
+	stats := passwdManager.getTrafficStats()
 	var buf bytes.Buffer
 	buf.WriteString("stat: ")
 	ret, _ := json.Marshal(stats)
